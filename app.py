@@ -931,7 +931,11 @@ def cmd_watch():
             # немногим (D4VM4 → D4VM4001), но не разросся (GC111 → GC1110VV061);
             # либо длинный код целиком встречается в названии
             found = [r for r, mc, nm in idx
-                     if (mc and (mc == f or (mc.startswith(f) and len(mc) <= len(f) + 4)))
+                     if (mc and (mc == f
+                                 # карточка подробнее нашего кода: D4VM4 → D4VM4001
+                                 or (mc.startswith(f) and len(mc) <= len(f) + 4)
+                                 # карточка короче на хвостик: DB1050A0 → DB1050
+                                 or (f.startswith(mc) and len(mc) >= 5 and len(f) <= len(mc) + 2)))
                      or (len(f) >= 6 and f in nm)]
             if not found:
                 # подсказка: что похожее вообще есть на площадках — сразу видно,
