@@ -486,7 +486,9 @@ def cmd_daily(only=None, allrows=None, limit=None, minutes=None):
     # запас времени на «остальное»: по умолчанию 5 часов, свои позиции обходим всегда
     budget = float(minutes or env("PM_REST_MINUTES", "300") or 300)
     started = time.monotonic()
-    if env("PM_WATCH_URL"):          # список наличия живёт в Product Center — обновим его
+    # перед каждым обходом сверяем наш список с карточками: за неделю площадки
+    # могли завести новые страницы под наши же модели
+    if env("PM_WATCH_URL") or (BASE / "watch.txt").is_file():
         try:
             cmd_watch()
         except Exception as e:
