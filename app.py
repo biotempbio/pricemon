@@ -932,7 +932,11 @@ def cmd_watch():
                      if (mc and (mc == f or (mc.startswith(f) and len(mc) <= len(f) + 4)))
                      or (len(f) >= 6 and f in nm)]
             if not found:
-                miss.append(code)
+                # подсказка: что похожее вообще есть на площадках — сразу видно,
+                # товара нет в продаже или это мы не сумели сопоставить код
+                near = [r["name"] for r, mc, nm in idx if mc and mc[:4] == f[:4]][:3]
+                miss.append(code + (" → рядом: " + "; ".join(n[:60] for n in near)
+                                    if near else " → похожего нет"))
                 continue
             hit[code] = len(found)
             for r in found:
