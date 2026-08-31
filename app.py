@@ -1,0 +1,908 @@
+#!/usr/bin/env python3
+# Мониторинг интернет цен — сравнение цен по брендам на нескольких площадках.
+# Команды: discover|daily|compare|report|selftest|init|selfupdate|postupdate
+import os, re, sys, json, time, random, hashlib, gzip, base64, ast, traceback
+import datetime as dt
+from html import unescape as _un
+from pathlib import Path
+
+import httpx
+import psycopg
+from psycopg.rows import dict_row
+
+BASE = Path("/opt/pricemon")
+DATA = Path("/var/lib/pricemon")
+RAW = DATA / "raw"
+PUB = DATA / "pub"
+for p in (RAW, PUB):
+    p.mkdir(parents=True, exist_ok=True)
+
+def env(k, d=""):
+    return os.environ.get(k, d)
+
+DSN = env("PM_DSN", "postgresql:///pricemon")
+# паузы между запросами; обход чередует площадки, поэтому пауза небольшая
+DELAY_MIN = float(env("PM_PAUSE_MIN", "1.5"))
+DELAY_MAX = float(env("PM_PAUSE_MAX", "3.5"))
+HTTP2 = env("PM_HTTP2", "0") == "1"
+SOURCE_GIVEUP = int(env("PM_SOURCE_GIVEUP", "12"))
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# ---------- бренды ----------
+# ключ — как показываем, значения — как бренд пишут в адресах страниц
+BRANDS = {
+    "unox": ("unox", "унокс"),
+    "carboma": ("carboma", "polyus", "polus", "карбома", "polair-carboma"),
+}
+BRAND_RE = {b: re.compile("|".join(v), re.I) for b, v in BRANDS.items()}
+
+def brand_of(text):
+    low = (text or "").lower()
+    for b, rx in BRAND_RE.items():
+        if rx.search(low):
+            return b
+    return None
+
+# ---------- площадки ----------
+# mode: entero | slug (бренд в адресе товара) | brandpage (бренд только у разделов)
+SOURCES = {
+    "entero": dict(base="https://entero.ru", mode="entero", title="Энтеро"),
+    "rkomplekt": dict(base="https://r-komplekt.ru", sm="/sitemap.xml", mode="slug",
+                      item="/catalog/", title="Ресторан Комплект",
+                      sect=r'/catalog/[^"\s<>]*/proizvoditel_[a-z]+/?$',
+                      link=r'/catalog/[^"?#\s<>]+/[^"?#\s<>]+/'),
+    "zamoroz": dict(base="https://zamoroz.ru", sm="/sitemap.xml", mode="slug",
+                    item="/catalog/", title="Заморозь.ру"),
+    "refro": dict(base="https://www.refro.ru", sm="/sitemap.xml", mode="brandpage",
+                  title="Рефро",
+                  sect=r'/category/[^"\s<>]*(?:unox|carboma|polyus)[^"\s<>]*/?$',
+                  link=r'/product/[^"?#\s<>]+/?'),
+}
+OFF = set(x for x in env("PM_SOURCES_OFF", "").split(",") if x)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS product (
+  id BIGSERIAL PRIMARY KEY,
+  source TEXT NOT NULL, ext_id TEXT NOT NULL, url TEXT NOT NULL,
+  name TEXT, model_code TEXT, brand TEXT, category TEXT,
+  status TEXT DEFAULT 'active',
+  first_seen TIMESTAMPTZ DEFAULT now(), last_seen TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (source, ext_id)
+);
+CREATE TABLE IF NOT EXISTS price_snapshot (
+  id BIGSERIAL PRIMARY KEY,
+  product_id BIGINT REFERENCES product(id) ON DELETE CASCADE,
+  captured_at TIMESTAMPTZ DEFAULT now(), captured_date DATE DEFAULT current_date,
+  price NUMERIC, old_price NUMERIC, availability TEXT,
+  in_stock BOOLEAN, ok BOOLEAN DEFAULT true,
+  UNIQUE (product_id, captured_date)
+);
+CREATE TABLE IF NOT EXISTS crawl_run (
+  id BIGSERIAL PRIMARY KEY, kind TEXT, started_at TIMESTAMPTZ DEFAULT now(),
+  finished_at TIMESTAMPTZ, ok INT DEFAULT 0, failed INT DEFAULT 0, note TEXT
+);
+ALTER TABLE product ADD COLUMN IF NOT EXISTS brand TEXT;
+ALTER TABLE product ADD COLUMN IF NOT EXISTS watch TEXT;
+ALTER TABLE price_snapshot ADD COLUMN IF NOT EXISTS in_stock BOOLEAN;
+CREATE INDEX IF NOT EXISTS ix_snap_prod ON price_snapshot(product_id, captured_date DESC);
+CREATE INDEX IF NOT EXISTS ix_prod_brand ON product(brand, status);
+"""
+
+def db():
+    return psycopg.connect(DSN, row_factory=dict_row, autocommit=True)
+
+def init_db():
+    with db() as c:
+        c.execute(SCHEMA)
+
+def sleep_polite():
+    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+class Blocked(Exception):
+    pass
+
+THROTTLE_SIG = re.compile(
+    r"ConnectionTerminated|ENHANCE_YOUR_CALM|GOAWAY|error_code:11|"
+    r"RemoteProtocolError|ConnectError|ReadTimeout|ConnectTimeout", re.I)
+
+# страница-капча приходит с кодом 200 — ловим её по тексту
+ANTIBOT = re.compile(
+    r"fail2ban|need_captcha|выглядят\s+автоматизированными|"
+    r"подтвердите,?\s*что\s+вы\s+человек|доступ\s+временно\s+ограничен", re.I)
+
+def fetch(client, url, tries=2):
+    last = None
+    for i in range(tries):
+        try:
+            r = client.get(url, headers=HEADERS, timeout=40, follow_redirects=True)
+            if r.status_code in (403, 429, 503):
+                raise Blocked(str(r.status_code))
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            html = r.text
+            if ANTIBOT.search(html[:6000]):
+                raise Blocked("капча: сайт просит подтвердить, что мы человек")
+            return html
+        except Blocked as e:
+            last = e
+            time.sleep(20 * (i + 1))
+        except Exception as e:
+            last = e
+            if THROTTLE_SIG.search(repr(e)):
+                last = Blocked(repr(e)[:80])
+                time.sleep(20 * (i + 1))
+            else:
+                time.sleep(5 * (i + 1))
+        finally:
+            sleep_polite()
+    raise last if last else RuntimeError("fetch failed")
+
+def strip_tags(s):
+    s = re.sub(r"<script.*?</script>|<style.*?</style>", " ", s or "", flags=re.S | re.I)
+    return re.sub(r"\s+", " ", _un(re.sub(r"<[^>]+>", " ", s))).strip()
+
+def to_num(s):
+    if s is None:
+        return None
+    t = re.sub(r"[^\d,.]", "", str(s)).replace("\xa0", "")
+    t = t.replace(",", ".") if t.count(",") == 1 and t.count(".") == 0 else t.replace(",", "")
+    try:
+        v = float(t)
+    except Exception:
+        return None
+    return v if v > 0 else None
+
+# ---------- разбор карточки ----------
+IN_STOCK = re.compile(r"instock|в\s*наличи|есть\s*в\s*наличии|на\s*складе", re.I)
+NO_STOCK = re.compile(r"outofstock|нет\s*в\s*наличии|под\s*заказ|ожидается|preorder|снят", re.I)
+
+# запчасть в названии несёт код аппарата, к которому подходит, — в сравнение её нельзя
+PART = re.compile(
+    r"стеклопакет|боковин|делител|перегородк|стыковочн|ручка|направляющ|кронштейн|"
+    r"\bтэн\b|двигател|актуатор|каркас|гастроемкост|подставк|термостат|уплотнител|"
+    r"\bпетл|фильтр|запчаст|комплектующ|для\s+печи|для\s+витрин|для\s+шкаф", re.I)
+
+def stock_of(text):
+    t = text or ""
+    if NO_STOCK.search(t):
+        return False
+    if IN_STOCK.search(t):
+        return True
+    return None
+
+def _jsonld(html):
+    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, re.S | re.I):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            d = stack.pop()
+            if isinstance(d, list):
+                stack.extend(d)
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = d.get("@type")
+            t = t if isinstance(t, str) else (t[0] if isinstance(t, list) and t else "")
+            if str(t).lower() == "product":
+                return d
+            stack.extend(v for v in d.values() if isinstance(v, (dict, list)))
+    return None
+
+def parse_shop(html):
+    """JSON-LD → микроразметка → запасные варианты."""
+    out = {"name": None, "price": None, "old_price": None,
+           "availability": None, "in_stock": None, "problems": [], "how": None}
+    d = _jsonld(html)
+    if d:
+        out["name"] = d.get("name")
+        offers = d.get("offers")
+        if isinstance(offers, list):
+            offers = offers[0] if offers else None
+        if isinstance(offers, dict):
+            out["price"] = to_num(offers.get("price") or offers.get("lowPrice"))
+            av = str(offers.get("availability") or "")
+            out["availability"] = av.rsplit("/", 1)[-1] or None
+            out["in_stock"] = stock_of(av)
+            out["how"] = "json-ld"
+    if out["price"] is None:
+        m = (re.search(r'itemprop="price"[^>]*content="([\d\s.,]+)"', html)
+             or re.search(r'content="([\d\s.,]+)"[^>]*itemprop="price"', html)
+             or re.search(r'property="product:price:amount"[^>]*content="([\d\s.,]+)"', html)
+             or re.search(r'itemprop="price"[^>]*>\s*([\d\s.,]+)', html))
+        if m:
+            out["price"] = to_num(m.group(1))
+            out["how"] = out["how"] or "микроразметка"
+    if out["price"] is None:
+        m = re.search(r'data-(?:price|value)="([\d\s.,]{4,})"', html)
+        if m:
+            out["price"] = to_num(m.group(1))
+            out["how"] = out["how"] or "data-атрибут"
+    if out["price"] is None:
+        m = re.search(r'class="[^"]*price[^"]*"[^>]*>[^<]*?([\d][\d\s\xa0]{3,})\s*(?:руб|₽|р\.)', html, re.I)
+        if m:
+            out["price"] = to_num(m.group(1))
+            out["how"] = out["how"] or "текст цены"
+    if not out["name"]:
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S | re.I)
+        out["name"] = strip_tags(m.group(1)) if m else None
+    if out["in_stock"] is None:
+        m = re.search(r'itemprop="availability"[^>]*(?:content|href)="([^"]+)"', html)
+        if m:
+            out["availability"] = m.group(1).rsplit("/", 1)[-1]
+            out["in_stock"] = stock_of(m.group(1))
+    if out["in_stock"] is None:
+        head = strip_tags(html)[:6000]
+        out["in_stock"] = stock_of(head)
+        if out["in_stock"] is not None:
+            out["availability"] = "В наличии" if out["in_stock"] else "Под заказ"
+    if out["price"] is None:
+        out["problems"].append("цена не найдена")
+    if not out["name"]:
+        out["problems"].append("название не найдено")
+    return out
+
+def parse_entero(html):
+    out = parse_shop(html)
+    if out["price"] is None:
+        m = re.search(r'"price"\s*:\s*"?([\d.]+)', html)
+        if m:
+            out["price"] = to_num(m.group(1))
+            out["how"] = "entero json"
+            out["problems"] = [x for x in out["problems"] if "цена" not in x]
+    return out
+
+PARSERS = {"entero": parse_entero}
+
+def parse_card(source, html):
+    return PARSERS.get(source, parse_shop)(html)
+
+def is_empty(d):
+    return d.get("price") is None and not d.get("name")
+
+# ---------- код модели: по нему сводим одну и ту же вещь с разных площадок ----------
+STOP_TOK = {"EU", "RU", "GN", "XL", "LUX", "ЛЮКС", "СТАНДАРТ", "STANDARD", "TECHNO",
+            "ТЕХНО", "ЭКО", "ECO", "CUBE", "PLUS", "МСК", "ВЕРСИЯ", "V2", "2.0",
+            "ONE", "PRO", "NEW", "БУ", "ГАЗ", "GAS", "МПС", "MP"}
+
+def norm_code(s):
+    s = (s or "").upper().replace("Ё", "Е").replace("\xa0", " ")
+    s = s.replace(",", ".").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", " ", s).strip()
+
+def model_code(name, brand=None):
+    n = norm_code(name)
+    if not n:
+        return None
+    for rx in BRAND_RE.values():
+        n = rx.sub(" ", n)
+    n = re.sub(r"\([^)]*\)", " ", n)
+    if brand == "unox":
+        m = re.search(r"\bX[A-Z]{1,4}\s?[- ]?\d{2,4}[A-Z0-9\-]*", n)
+        if m:
+            return re.sub(r"[\s]+", "", m.group(0))
+    toks = []
+    for t in re.findall(r"[A-ZА-Я0-9][A-ZА-Я0-9./\-]*", n):
+        if t in STOP_TOK or len(t) < 2:
+            continue
+        if re.search(r"\d", t) or (len(t) >= 2 and re.match(r"^[A-Z]+$", t)):
+            toks.append(t)
+    if not toks:
+        return None
+    return "-".join(toks[:5])
+
+# ---------- поиск товаров ----------
+RE_LOC = re.compile(r"<loc>\s*([^<]+)\s*</loc>")
+NOT_ITEM = re.compile(r"proizvoditel_|/filter/|/brand[s]?/|/vendors?/|/category/|/list/|/news/|/stati/", re.I)
+RE_HREF = re.compile(r'href="([^"#]+)"')
+ENTERO = "https://entero.ru"
+RE_ITEM = re.compile(r'href="(/item/(\d+))"')
+
+def sitemap_urls(client, cfg, log):
+    idx = fetch(client, cfg["base"] + cfg["sm"])
+    maps = [u.strip() for u in RE_LOC.findall(idx or "")]
+    if not maps:
+        return []
+    if not any(m.endswith(".xml") for m in maps):
+        return maps
+    out = []
+    for m in maps:
+        if "geo" in m or "files" in m:
+            continue
+        try:
+            xml = fetch(client, m)
+        except Exception as e:
+            log("  sitemap %s: %s" % (m, repr(e)[:60]))
+            continue
+        out += [u.strip() for u in RE_LOC.findall(xml or "")]
+    return out
+
+def discover_entero(client, log):
+    urls = {}
+    for brand, keys in BRANDS.items():
+        for key in keys[:1]:
+            hubs = ["%s/vendors/%s" % (ENTERO, key)] + \
+                   ["%s/vendors/%s/%d" % (ENTERO, key, n) for n in (500, 501, 502)]
+            lists = set()
+            for h in hubs:
+                try:
+                    html = fetch(client, h)
+                except Exception:
+                    continue
+                if not html:
+                    continue
+                for m in RE_ITEM.finditer(html):
+                    urls[m.group(2)] = (ENTERO + m.group(1), brand)
+                for m in re.finditer(r'href="(/list/[^"#?]*%s[^"#?]*/?)"' % key, html, re.I):
+                    lists.add(ENTERO + m.group(1))
+            for lu in sorted(lists):
+                for page in range(1, 60):
+                    u = lu if page == 1 else "%s?p=%d" % (lu, page)
+                    try:
+                        html = fetch(client, u)
+                    except Exception:
+                        break
+                    if not html:
+                        break
+                    found = {m.group(2): (ENTERO + m.group(1), brand)
+                             for m in RE_ITEM.finditer(html)}
+                    new = set(found) - set(urls)
+                    urls.update(found)
+                    if not new:
+                        break
+            log("  entero/%s: накопилось %d" % (brand, len(urls)))
+    return [("entero", k, v[0], v[1]) for k, v in urls.items()]
+
+def discover_slug(name, cfg, client, log):
+    urls = {}
+    for u in sitemap_urls(client, cfg, log):
+        low = u.lower()
+        if cfg["item"] not in low or NOT_ITEM.search(low):
+            continue
+        b = brand_of(low)
+        if not b:
+            continue
+        key = low.rstrip("/").rsplit("/", 1)[-1]
+        urls[key] = (u, b)
+    log("  %s: %d карточек из карты сайта" % (name, len(urls)))
+    return [(name, k, v[0], v[1]) for k, v in urls.items()]
+
+def discover_brandpage(name, cfg, client, log):
+    sect_rx = re.compile(cfg["sect"], re.I)
+    link_rx = re.compile(cfg["link"], re.I)
+    sects = []
+    for u in sitemap_urls(client, cfg, log):
+        if sect_rx.search(u) and brand_of(u):
+            sects.append(u)
+    log("  %s: разделов бренда в карте сайта — %d" % (name, len(sects)))
+    urls = {}
+    for su in sects:
+        b = brand_of(su)
+        for page in range(1, 30):
+            u = su if page == 1 else "%s?PAGEN_1=%d" % (su.rstrip("/") + "/", page)
+            try:
+                html = fetch(client, u)
+            except Exception as e:
+                log("  %s: %s — %s" % (name, u, repr(e)[:60]))
+                break
+            if not html:
+                break
+            found = {}
+            for m in RE_HREF.finditer(html):
+                h = m.group(1)
+                if not link_rx.fullmatch(h) and not link_rx.fullmatch(h.rstrip("/") + "/"):
+                    continue
+                if "proizvoditel_" in h or "/filter/" in h:
+                    continue
+                full = h if h.startswith("http") else cfg["base"] + h
+                found[h.rstrip("/").rsplit("/", 1)[-1]] = (full, b)
+            new = set(found) - set(urls)
+            urls.update(found)
+            if not new:
+                break
+    log("  %s: %d карточек со страниц бренда" % (name, len(urls)))
+    return [(name, k, v[0], v[1]) for k, v in urls.items()]
+
+def cmd_discover():
+    init_db()
+    lines = []
+    log = lambda s: (lines.append(s), print(s, flush=True))
+    rows = []
+    with httpx.Client(http2=HTTP2) as client, db() as c:
+        for name, cfg in SOURCES.items():
+            if name in OFF:
+                log("%s: выключен настройкой" % name)
+                continue
+            log("%s (%s):" % (cfg["title"], name))
+            try:
+                if cfg["mode"] == "entero":
+                    rows += discover_entero(client, log)
+                elif cfg["mode"] == "slug":
+                    rows += discover_slug(name, cfg, client, log)
+                else:
+                    rows += discover_brandpage(name, cfg, client, log)
+            except Exception as e:
+                log("  ОШИБКА %s: %s" % (name, repr(e)[:160]))
+        for src, ext, url, brand in rows:
+            c.execute(
+                "INSERT INTO product(source, ext_id, url, brand) VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (source, ext_id) DO UPDATE SET url=EXCLUDED.url, "
+                "brand=COALESCE(product.brand, EXCLUDED.brand), last_seen=now()",
+                (src, ext[:200], url, brand))
+        stat = c.execute("SELECT source, brand, count(*) n FROM product WHERE status='active'"
+                         " GROUP BY source, brand ORDER BY source, brand").fetchall()
+    log("")
+    log("ИТОГО в базе:")
+    for r in stat:
+        log("  %-11s %-9s %5d" % (r["source"], r["brand"] or "?", r["n"]))
+    (PUB / "discovery.txt").write_text("\n".join(lines), encoding="utf-8")
+
+def interleave(rows):
+    """Чередуем площадки, чтобы не бить одну подряд."""
+    by = {}
+    for r in rows:
+        by.setdefault(r["source"], []).append(r)
+    qs = list(by.values())
+    out = []
+    for i in range(max((len(q) for q in qs), default=0)):
+        for q in qs:
+            if i < len(q):
+                out.append(q[i])
+    return out
+
+def cmd_daily(only=None, allrows=None, limit=None):
+    init_db()
+    ok = fail = skipped = 0
+    bad, closed, report = {}, set(), []
+    with httpx.Client(http2=HTTP2) as client, db() as c:
+        q = "SELECT * FROM product WHERE status='active'"
+        # allrows: обойти все карточки площадки, даже неотмеченные
+        if not allrows and c.execute(
+                "SELECT count(*) n FROM product WHERE watch IS NOT NULL").fetchone()["n"]:
+            q += " AND watch IS NOT NULL"
+        if only:
+            q += " AND source='%s'" % re.sub(r"\W", "", only)
+        prods = c.execute(q + " ORDER BY source, id").fetchall()
+        prods = interleave([p for p in prods if p["source"] in SOURCES and p["source"] not in OFF])
+        if limit:
+            prods = prods[:int(limit)]
+        n = len(prods)
+        run = c.execute("INSERT INTO crawl_run(kind) VALUES ('daily') RETURNING id").fetchone()["id"]
+        for i, p in enumerate(prods):
+            if p["source"] in closed:
+                skipped += 1
+                continue
+            if i % 25 == 0:
+                (PUB / "daily-progress.txt").write_text(
+                    "%d из %d, ошибок %d, пропущено %d, %s" %
+                    (i, n, fail, skipped, dt.datetime.now().isoformat(timespec="seconds")),
+                    encoding="utf-8")
+            try:
+                html = fetch(client, p["url"])
+                if not html:
+                    c.execute("UPDATE product SET status='gone' WHERE id=%s", (p["id"],))
+                    continue
+                d = parse_card(p["source"], html)
+                # пустая страница не должна стирать вчерашнюю цену
+                if is_empty(d):
+                    raise Blocked("страница прочиталась пустой — прежние данные не трогаю")
+                bad[p["source"]] = 0
+                nm = d.get("name") or p["name"]
+                br = p["brand"] or brand_of(nm) or brand_of(p["url"])
+                c.execute("UPDATE product SET name=COALESCE(%s,name), brand=COALESCE(%s,brand),"
+                          " model_code=%s, last_seen=now() WHERE id=%s",
+                          (nm, br, model_code(nm, br), p["id"]))
+                c.execute(
+                    "INSERT INTO price_snapshot(product_id,price,old_price,availability,in_stock,ok)"
+                    " VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (product_id,captured_date) DO UPDATE"
+                    " SET price=EXCLUDED.price, availability=EXCLUDED.availability,"
+                    " in_stock=EXCLUDED.in_stock, ok=EXCLUDED.ok",
+                    (p["id"], d.get("price"), d.get("old_price"), d.get("availability"),
+                     d.get("in_stock"), not d["problems"]))
+                ok += 1
+                report.append("OK  %-11s %-30s %10s  %s" %
+                              (p["source"], (nm or "")[:30], d.get("price"), d.get("availability")))
+            except Exception as e:
+                fail += 1
+                src = p["source"]
+                bad[src] = bad.get(src, 0) + 1
+                report.append("ERR %-11s %s %s" % (src, p["ext_id"], repr(e)[:100]))
+                if bad[src] >= SOURCE_GIVEUP and src not in closed:
+                    closed.add(src)
+                    report.append("SKIP: %s отказывает подряд %d раз — откладываю, "
+                                  "прежние цены остаются как есть" % (src, bad[src]))
+                    _step("SKIP_" + src)
+        c.execute("UPDATE crawl_run SET finished_at=now(), ok=%s, failed=%s WHERE id=%s",
+                  (ok, fail, run))
+    (PUB / "daily-progress.txt").write_text(
+        "%d из %d, ошибок %d, пропущено %d, %s, завершён" %
+        (n, n, fail, skipped, dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
+    (PUB / "daily.txt").write_text("обработано %d, ошибок %d, пропущено %d\n%s"
+                                   % (ok, fail, skipped, "\n".join(report)), encoding="utf-8")
+    print("daily: ok=%d fail=%d skipped=%d" % (ok, fail, skipped))
+
+# ---------- сравнение цен ----------
+def latest():
+    """Последнее удачное чтение по каждой карточке."""
+    with db() as c:
+        rows = c.execute("""
+            SELECT DISTINCT ON (s.product_id) s.product_id, s.captured_date, s.price,
+                   s.availability, s.in_stock, p.source, p.name, p.url, p.brand, p.model_code
+            FROM price_snapshot s JOIN product p ON p.id=s.product_id
+            WHERE p.status='active' AND s.ok AND s.price IS NOT NULL
+            ORDER BY s.product_id, s.captured_date DESC
+        """).fetchall()
+    return rows
+
+def build_table(in_stock_only=True):
+    rows = latest()
+    groups = {}
+    skipped_parts = 0
+    for r in rows:
+        # отключённые площадки в сводку не попадают
+        if r["source"] not in SOURCES or r["source"] in OFF:
+            continue
+        if PART.search(r["name"] or ""):
+            skipped_parts += 1
+            continue
+        if in_stock_only and r["in_stock"] is False:
+            continue
+        key = (r["brand"] or "?", r["model_code"] or (r["name"] or "")[:40].upper())
+        groups.setdefault(key, []).append(r)
+    out = []
+    for (brand, code), rs in groups.items():
+        best = min(rs, key=lambda x: float(x["price"]))
+        worst = max(rs, key=lambda x: float(x["price"]))
+        by = {}
+        for r in rs:
+            s = r["source"]
+            if s not in by or float(r["price"]) < float(by[s]["price"]):
+                by[s] = r
+        out.append({
+            "brand": brand, "code": code,
+            "name": best["name"] or code,
+            "sources": by,
+            "n": len(by),
+            "min": float(best["price"]), "min_src": best["source"], "min_url": best["url"],
+            "max": float(worst["price"]),
+            "spread": float(worst["price"]) - float(best["price"]),
+            "spread_pct": (float(worst["price"]) - float(best["price"])) / float(best["price"]) * 100,
+        })
+    out.sort(key=lambda x: (-x["n"], -x["spread_pct"]))
+    (PUB / "parts.txt").write_text("отсеяно запчастей: %d\n" % skipped_parts,
+                                   encoding="utf-8")
+    return out
+
+def cmd_compare(in_stock="1"):
+    init_db()
+    tbl = build_table(in_stock_only=(str(in_stock) != "0"))
+    import csv
+    names = [s for s in SOURCES if s not in OFF]
+    with (PUB / "compare.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["Бренд", "Код модели", "Название", "Площадок"] +
+                   [SOURCES[s]["title"] for s in names] +
+                   ["Минимум", "У кого", "Разброс, ₽", "Разброс, %", "Ссылка на минимум"])
+        for t in tbl:
+            w.writerow([t["brand"], t["code"], t["name"], t["n"]] +
+                       [("%.0f" % float(t["sources"][s]["price"])) if s in t["sources"] else ""
+                        for s in names] +
+                       ["%.0f" % t["min"], SOURCES[t["min_src"]]["title"],
+                        "%.0f" % t["spread"], "%.1f" % t["spread_pct"], t["min_url"]])
+    multi = [t for t in tbl if t["n"] > 1]
+    json.dump({"generated": dt.datetime.now().isoformat(timespec="seconds"),
+               "brands": sorted(set(t["brand"] for t in tbl)),
+               "positions": len(tbl), "comparable": len(multi),
+               "rows": [{k: v for k, v in t.items() if k != "sources"} for t in tbl]},
+              (PUB / "compare.json").open("w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print("compare: позиций %d, сравнимых %d" % (len(tbl), len(multi)))
+    return tbl
+
+# ---------- утреннее письмо ----------
+def cmd_report(in_stock="1"):
+    tbl = cmd_compare(in_stock)
+    multi = [t for t in tbl if t["n"] > 1]
+    names = [s for s in SOURCES if s not in OFF]
+    date = dt.date.today().strftime("%d.%m")
+    per_brand = {}
+    for t in tbl:
+        per_brand.setdefault(t["brand"], []).append(t)
+    subj = "Цены %s · %s" % (date, " · ".join(
+        "%s %d" % (b, len(v)) for b, v in sorted(per_brand.items())))
+
+    def head():
+        return "".join("<th align=right>%s</th>" % SOURCES[s]["title"] for s in names)
+
+    def body(rs):
+        out = []
+        for t in rs[:200]:
+            cells = []
+            for s in names:
+                if s in t["sources"]:
+                    p = float(t["sources"][s]["price"])
+                    hit = " style='background:#E8F5E9;font-weight:600'" if s == t["min_src"] else ""
+                    cells.append("<td align=right%s>%s</td>" % (hit, "{:,.0f}".format(p).replace(",", " ")))
+                else:
+                    cells.append("<td align=right style='color:#C7CFD3'>—</td>")
+            out.append("<tr><td><a href='%s' style='color:#12181B'>%s</a><br>"
+                       "<small style='color:#6B7C84'>%s</small></td>%s"
+                       "<td align=right>%s</td></tr>"
+                       % (t["min_url"], t["name"][:70], t["code"], "".join(cells),
+                          "+%.0f%%" % t["spread_pct"] if t["spread_pct"] else "—"))
+        return "".join(out) or "<tr><td colspan=9>нет данных</td></tr>"
+
+    blocks = ""
+    for b, rs in sorted(per_brand.items()):
+        m = [t for t in rs if t["n"] > 1]
+        blocks += ("<h3 style='margin:24px 0 6px'>%s — %d позиций, из них на нескольких "
+                   "площадках %d</h3><table width='100%%' cellpadding='6' "
+                   "style='border-collapse:collapse;font-size:13px'>"
+                   "<tr style='background:#F2F4F5'><th align=left>Модель</th>%s"
+                   "<th align=right>Разброс</th></tr>%s</table>"
+                   % (b.capitalize(), len(rs), len(m), head(), body(m or rs)))
+
+    html = ("<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#12181B\">"
+            "<h2 style='margin:0 0 4px'>Мониторинг цен — %s</h2>"
+            "<p style='color:#6B7C84;margin:0'>Позиций в наличии: %d. Есть с чем сравнить "
+            "(две площадки и больше): %d. Зелёным — самая низкая цена.</p>%s"
+            "<p style='color:#6B7C84;font-size:12px;margin-top:24px'>"
+            "Полная таблица: compare.csv и compare.json на сервере · %s</p>"
+            "</body></html>" % (date, len(tbl), len(multi), blocks,
+                                dt.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    (PUB / "report.html").write_text(html, encoding="utf-8")
+    send_mail(subj, html)
+    print("report:", subj)
+
+# сервер отправки подставляем по адресу отправителя
+SMTP_BY_DOMAIN = {
+    "gmail.com": ("smtp.gmail.com", 465),
+    "yandex.ru": ("smtp.yandex.ru", 465), "ya.ru": ("smtp.yandex.ru", 465),
+    "mail.ru": ("smtp.mail.ru", 465), "bk.ru": ("smtp.mail.ru", 465),
+    "list.ru": ("smtp.mail.ru", 465), "inbox.ru": ("smtp.mail.ru", 465),
+}
+
+def smtp_target():
+    user = env("PM_SMTP_USER").strip()
+    dom = user.rsplit("@", 1)[-1].lower() if "@" in user else ""
+    host, port = SMTP_BY_DOMAIN.get(dom, (env("PM_SMTP_HOST"), int(env("PM_SMTP_PORT", "465") or 465)))
+    pwd = env("PM_SMTP_PASS").strip()
+    # пароль приложения Google — ровно 16 букв, разделители убираем
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", pwd)
+    if len(cleaned) == 16 and len(pwd) != 16:
+        pwd = cleaned
+    return host, port, user, pwd, env("PM_MAIL_TO").strip()
+
+def send_mail(subject, html):
+    import smtplib
+    from email.message import EmailMessage
+    host, port, user, pwd, to = smtp_target()
+    if not (host and user and pwd and to):
+        print("SMTP не настроен — письмо не отправлено, отчёт лежит в pub/report.html")
+        return False
+    m = EmailMessage()
+    m["Subject"] = subject
+    m["From"] = user
+    m["To"] = to
+    m.set_content("Отчёт в формате HTML.")
+    m.add_alternative(html, subtype="html")
+    try:
+        with smtplib.SMTP_SSL(host, port, timeout=40) as s:
+            s.login(user, pwd)
+            s.send_message(m)
+        print("письмо отправлено на", to)
+        return True
+    except Exception as e:
+        msg = "%s: %s" % (type(e).__name__, str(e)[:300])
+        print("письмо не ушло:", msg)
+        return msg
+
+
+_LOG = []
+
+def log(t):
+    """Протокол разведки — накапливаем и сразу кладём в /pub/discovery.txt."""
+    _LOG.append(str(t))
+    print(t)
+    (PUB / "discovery.txt").write_text("\n".join(_LOG) + "\n", encoding="utf-8")
+
+def _step(msg):
+    with (PUB / "steps.txt").open("a", encoding="utf-8") as f:
+        f.write("%s %s\n" % (msg, dt.datetime.now().isoformat(timespec="seconds")))
+
+
+RUN_OK = {"daily", "discover", "report", "compare", "secure", "stats"}
+
+def _why(t):
+    (PUB / "run.txt").write_text("%s\n%s\n" % (t, dt.datetime.now().isoformat(timespec="seconds")),
+                                 encoding="utf-8")
+
+def _maybe_run(ci):
+    m = re.search(r"^#\s*PM_RUN:\s*(.+)$", ci, re.M)
+    if not m:
+        return _why("строки PM_RUN в cloud-init нет")
+    line = m.group(0)
+    tag = hashlib.sha256(line.encode()).hexdigest()[:10]
+    mark = BASE / (".run-" + tag)
+    if mark.exists():
+        return _why("уже выполнялось: %s (метка %s)" % (line, tag))
+    parts = m.group(1).split("#")[0].split()
+    if not parts or parts[0] not in RUN_OK:
+        mark.write_text("skip")
+        return _why("команда не разрешена: %s" % line)
+    _why("запускаю: %s" % line)
+    mark.write_text("run")
+    _step("RUN_" + parts[0])
+    os.execv(sys.executable, [sys.executable, str(BASE / "app.py")] + parts)
+
+def _absorb_secrets(ci):
+    """Переносим строки «# PM_...:» из cloud-init в .env и убираем из памяти."""
+    got = {}
+    for key in ("PM_SMTP_USER", "PM_SMTP_PASS", "PM_MAIL_TO",
+                "PM_GIT_URL", "PM_GIT_TOKEN"):
+        # берём последнюю такую строку
+        vals = [v.strip() for v in re.findall(r"^#\s*%s:[ \t]*(.+?)[ \t]*$" % key, ci, re.M)]
+        vals = [v for v in vals if v and not v.startswith("__")]
+        if vals:
+            got[key] = vals[-1]
+    if not got:
+        return
+    envf = BASE / ".env"
+    try:
+        lines = envf.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        lines = []
+    cur = {}
+    for ln in lines:
+        if "=" in ln and not ln.lstrip().startswith("#"):
+            k, v = ln.split("=", 1)
+            cur[k.strip()] = v
+    if all(cur.get(k) == v for k, v in got.items()):
+        for k, v in got.items():
+            os.environ[k] = v
+        return
+    keep = [ln for ln in lines if ln.split("=", 1)[0].strip() not in got]
+    envf.write_text("\n".join(keep + ["%s=%s" % (k, v) for k, v in got.items()]) + "\n",
+                    encoding="utf-8")
+    for k, v in got.items():
+        os.environ[k] = v
+    _step("ENV_SET_" + "_".join(sorted(got)))
+
+TW_API = "https://api.timeweb.cloud/api/v1/servers/%s"
+
+def cmd_stats():
+    """Сколько карточек и сколько из них в списке — по площадкам и брендам."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT source, coalesce(brand,'?') b, count(*) n, count(watch) w,"
+            " count(*) FILTER (WHERE model_code IS NOT NULL) mc"
+            " FROM product WHERE status='active' GROUP BY 1,2 ORDER BY 1,2").fetchall()
+        pr = c.execute(
+            "SELECT p.source, coalesce(p.brand,'?') b, count(DISTINCT p.id) n"
+            " FROM product p JOIN price_snapshot s ON s.product_id=p.id"
+            " WHERE s.ok AND s.price IS NOT NULL GROUP BY 1,2 ORDER BY 1,2").fetchall()
+    have = {(x["source"], x["b"]): x["n"] for x in pr}
+    out = ["площадка   бренд    карточек  в списке  с кодом  с ценой"]
+    out += ["%-10s %-8s %8d %9d %8d %8d"
+            % (x["source"], x["b"], x["n"], x["w"], x["mc"],
+               have.get((x["source"], x["b"]), 0)) for x in rows]
+    (PUB / "stats.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+    print("\n".join(out))
+
+def cmd_secure():
+    """Убираем из публичной папки то, чего там быть не должно."""
+    moved = []
+    for f in ("db.sql.gz", "catalog.json", "catalog.xlsx"):
+        p = PUB / f
+        if p.is_file():
+            p.rename(DATA / f)
+            moved.append(f)
+    # каталог вместо файла: ночной дамп больше сюда не запишется
+    d = PUB / "db.sql.gz"
+    if not d.exists():
+        d.mkdir()
+    (PUB / "secure.txt").write_text(
+        "перенесено из публичной папки: %s\n%s\n" %
+        (", ".join(moved) or "нечего", dt.datetime.now().isoformat(timespec="seconds")),
+        encoding="utf-8")
+    print("secure:", moved)
+
+def cmd_selfupdate():
+    sid, tok = env("PM_TW_SERVER_ID"), env("PM_TW_TOKEN")
+    if not (sid and tok):
+        return
+    try:
+        r = httpx.get(TW_API % sid, headers={"Authorization": "Bearer " + tok}, timeout=30)
+        ci = r.json().get("server", {}).get("cloud_init") or ""
+    except Exception as e:
+        print("SU_ERR", repr(e)[:120])
+        return
+    _absorb_secrets(ci)
+    code = None
+    gu = env("PM_GIT_URL")
+    if gu:
+        try:
+            h = {}
+            gt = env("PM_GIT_TOKEN")
+            if gt:
+                h["Authorization"] = "Bearer " + gt
+            g = httpx.get(gu, headers=h, timeout=30)
+            g.raise_for_status()
+            ast.parse(g.content)
+            code = g.content
+            (PUB / "git.txt").write_text(
+                "код берётся из git\nадрес: %s\nразмер: %d байт\nключ: %s\n%s\n"
+                % (re.sub(r"://[^@]*@", "://", gu.split("?")[0]), len(code),
+                   "задан (%d знаков)" % len(gt) if gt else "не нужен",
+                   dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
+        except Exception as e:
+            print("SU_GITERR", repr(e)[:120])
+    if code is None:
+        m = re.search(r"<<'B64'\n(.*?)\nB64\n", ci, re.S)
+        if not m:
+            return
+        try:
+            code = gzip.decompress(base64.b64decode(m.group(1)))
+            ast.parse(code)
+        except Exception as e:
+            print("SU_BADCODE", repr(e)[:120])
+            return
+    me = BASE / "app.py"
+    cur = me.read_bytes() if me.exists() else b""
+    if hashlib.sha256(cur).digest() == hashlib.sha256(code).digest():
+        _maybe_run(ci)
+        return
+    me.write_bytes(code)
+    _step("SU_UPDATED_" + hashlib.sha256(code).hexdigest()[:8])
+    os.execv(sys.executable, [sys.executable, str(me), "postupdate"])
+
+def cmd_postupdate():
+    sid, tok = env("PM_TW_SERVER_ID"), env("PM_TW_TOKEN")
+    if not (sid and tok):
+        return
+    try:
+        r = httpx.get(TW_API % sid, headers={"Authorization": "Bearer " + tok}, timeout=30)
+        ci = r.json().get("server", {}).get("cloud_init") or ""
+        _absorb_secrets(ci)
+        _maybe_run(ci)
+    except Exception as e:
+        print("PU_ERR", repr(e)[:120])
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+    args = sys.argv[2:]
+    fn = {"discover": cmd_discover, "daily": cmd_daily, "compare": cmd_compare,
+          "report": cmd_report, "init": init_db, "secure": cmd_secure,
+          "stats": cmd_stats,
+          "selfupdate": cmd_selfupdate, "postupdate": cmd_postupdate,
+          # старые таймеры с каталожных времён — чтобы не падали, ведут на новое
+          "crawl": cmd_daily, "export": cmd_compare,
+          "media": lambda *a: print("media больше не нужна — каталог собран")}.get(cmd)
+    if not fn:
+        print("неизвестная команда:", cmd)
+        sys.exit(2)
+    # любая поломка должна быть видна снаружи, а не только в системном журнале
+    try:
+        fn(*args)
+        (PUB / ("last-%s.txt" % cmd)).write_text(
+            "%s %s — успешно\n%s\n" % (cmd, " ".join(args),
+                                       dt.datetime.now().isoformat(timespec="seconds")),
+            encoding="utf-8")
+    except Exception:
+        (PUB / ("last-%s.txt" % cmd)).write_text(
+            "%s %s — ОШИБКА\n%s\n\n%s" % (cmd, " ".join(args),
+                                           dt.datetime.now().isoformat(timespec="seconds"),
+                                           traceback.format_exc()[-2000:]),
+            encoding="utf-8")
+        raise
