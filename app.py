@@ -925,7 +925,12 @@ def cmd_watch():
             if len(f) < 4:
                 miss.append(code + " (код короче четырёх знаков — не ищу)")
                 continue
-            found = [r for r, mc, nm in idx if (mc and mc == f) or (len(f) >= 6 and f in nm)]
+            # точное совпадение; либо код модели начинается с нашего и дописан
+            # немногим (D4VM4 → D4VM4001), но не разросся (GC111 → GC1110VV061);
+            # либо длинный код целиком встречается в названии
+            found = [r for r, mc, nm in idx
+                     if (mc and (mc == f or (mc.startswith(f) and len(mc) <= len(f) + 4)))
+                     or (len(f) >= 6 and f in nm)]
             if not found:
                 miss.append(code)
                 continue
