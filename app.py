@@ -478,33 +478,52 @@ def interleave(rows):
                 out.append(q[i])
     return out
 
-def cmd_daily(only=None, allrows=None, limit=None):
+def cmd_daily(only=None, allrows=None, limit=None, minutes=None):
+    """Сначала наши позиции в наличии, потом — в оставшееся время — всё остальное."""
     init_db()
     ok = fail = skipped = 0
     bad, closed, report = {}, set(), []
+    # запас времени на «остальное»: по умолчанию 5 часов, свои позиции обходим всегда
+    budget = float(minutes or env("PM_REST_MINUTES", "300") or 300)
+    started = time.monotonic()
+    if env("PM_WATCH_URL"):          # список наличия живёт в Product Center — обновим его
+        try:
+            cmd_watch()
+        except Exception as e:
+            print("WATCH_ERR", repr(e)[:120])
     with httpx.Client(http2=HTTP2) as client, db() as c:
         q = "SELECT * FROM product WHERE status='active'"
-        # allrows: обойти все карточки площадки, даже неотмеченные
-        if not allrows and c.execute(
-                "SELECT count(*) n FROM product WHERE watch IS NOT NULL").fetchone()["n"]:
-            q += " AND watch IS NOT NULL"
         if only:
             q += " AND source='%s'" % re.sub(r"\W", "", only)
-        prods = c.execute(q + " ORDER BY source, id").fetchall()
-        prods = interleave([p for p in prods if p["source"] in SOURCES and p["source"] not in OFF])
+        rows = [p for p in c.execute(q + " ORDER BY source, id").fetchall()
+                if p["source"] in SOURCES and p["source"] not in OFF]
+        ours = interleave([p for p in rows if p["watch"] is not None])
+        # остальные — начиная с тех, которые дольше всех не проверялись
+        rest = interleave(sorted([p for p in rows if p["watch"] is None],
+                                 key=lambda p: (p["last_seen"] is not None, p["last_seen"])))
+        if allrows or not ours:      # список не задан или явно просят обойти всё подряд
+            ours, rest = interleave(rows), []
+        prods = ours + rest
+        n_ours = len(ours)
         if limit:
             prods = prods[:int(limit)]
         n = len(prods)
         run = c.execute("INSERT INTO crawl_run(kind) VALUES ('daily') RETURNING id").fetchone()["id"]
         for i, p in enumerate(prods):
+            # свои позиции обходим полностью, у остальных есть лимит по времени
+            if i >= n_ours and (time.monotonic() - started) / 60 > budget:
+                report.append("СТОП: время на «остальное» вышло (%.0f мин), "
+                              "проверено %d из %d прочих" % (budget, i - n_ours, n - n_ours))
+                skipped += n - i
+                break
             if p["source"] in closed:
                 skipped += 1
                 continue
             if i % 25 == 0:
                 (PUB / "daily-progress.txt").write_text(
-                    "%d из %d, ошибок %d, пропущено %d, %s" %
-                    (i, n, fail, skipped, dt.datetime.now().isoformat(timespec="seconds")),
-                    encoding="utf-8")
+                    "наши позиции: %d из %d · остальные: %d из %d · ошибок %d · %s" %
+                    (min(i, n_ours), n_ours, max(0, i - n_ours), n - n_ours, fail,
+                     dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
             try:
                 html = fetch(client, p["url"])
                 if not html:
@@ -542,12 +561,13 @@ def cmd_daily(only=None, allrows=None, limit=None):
                     _step("SKIP_" + src)
         c.execute("UPDATE crawl_run SET finished_at=now(), ok=%s, failed=%s WHERE id=%s",
                   (ok, fail, run))
-    (PUB / "daily-progress.txt").write_text(
-        "%d из %d, ошибок %d, пропущено %d, %s, завершён" %
-        (n, n, fail, skipped, dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
-    (PUB / "daily.txt").write_text("обработано %d, ошибок %d, пропущено %d\n%s"
-                                   % (ok, fail, skipped, "\n".join(report)), encoding="utf-8")
-    print("daily: ok=%d fail=%d skipped=%d" % (ok, fail, skipped))
+    summary = ("наши позиции: %d карточек · остальные: %d · проверено %d, ошибок %d, "
+            "не дошли %d\n%s, завершён"
+            % (n_ours, n - n_ours, ok, fail, skipped,
+               dt.datetime.now().isoformat(timespec="seconds")))
+    (PUB / "daily-progress.txt").write_text(summary, encoding="utf-8")
+    (PUB / "daily.txt").write_text(summary + "\n\n" + "\n".join(report), encoding="utf-8")
+    print("daily: свои=%d ok=%d fail=%d skipped=%d" % (n_ours, ok, fail, skipped))
 
 # ---------- сравнение цен ----------
 def latest():
@@ -631,6 +651,28 @@ def cmd_compare(in_stock="1"):
     return tbl
 
 # ---------- утреннее письмо ----------
+def coverage_line():
+    """Главная строка письма: сколько наших позиций проверено и сколько не нашлось."""
+    try:
+        with db() as c:
+            r = c.execute(
+                "SELECT count(DISTINCT watch) codes, count(*) cards,"
+                " count(*) FILTER (WHERE last_seen > now() - interval '30 hours') fresh"
+                " FROM product WHERE status='active' AND watch IS NOT NULL").fetchone()
+    except Exception:
+        return "Список наших позиций не задан — смотрим всё, что нашли на площадках."
+    if not r or not r["codes"]:
+        return ("Список наших позиций не задан — смотрим всё, что нашли на площадках. "
+                "Пока это не наличие, а весь каталог площадок.")
+    miss = 0
+    f = PUB / "watch.txt"
+    if f.is_file():
+        m = re.search(r"не нашлось нигде:\s*(\d+)", f.read_text(encoding="utf-8"))
+        miss = int(m.group(1)) if m else 0
+    return ("<b>Наши позиции в наличии: %d.</b> Карточек по ним на площадках %d, "
+            "из них проверено за сутки %d. Не нашлось ни на одной площадке: %d."
+            % (r["codes"] + miss, r["cards"], r["fresh"], miss))
+
 def cmd_report(in_stock="1"):
     tbl = cmd_compare(in_stock)
     multi = [t for t in tbl if t["n"] > 1]
@@ -682,11 +724,12 @@ def cmd_report(in_stock="1"):
 
     html = ("<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#12181B\">"
             "<h2 style='margin:0 0 4px'>Мониторинг цен — %s</h2>"
+            "<p style='color:#12181B;margin:0 0 6px'>%s</p>"
             "<p style='color:#6B7C84;margin:0'>Позиций в наличии: %d. Есть с чем сравнить "
             "(две площадки и больше): %d. Зелёным — самая низкая цена.</p>%s"
             "<p style='color:#6B7C84;font-size:12px;margin-top:24px'>"
             "Полная таблица: compare.csv и compare.json на сервере · %s</p>"
-            "</body></html>" % (date, len(tbl), len(multi), blocks,
+            "</body></html>" % (date, coverage_line(), len(tbl), len(multi), blocks,
                                 dt.datetime.now().strftime("%Y-%m-%d %H:%M")))
     (PUB / "report.html").write_text(html, encoding="utf-8")
     send_mail(subj, html)
@@ -749,7 +792,7 @@ def _step(msg):
         f.write("%s %s\n" % (msg, dt.datetime.now().isoformat(timespec="seconds")))
 
 
-RUN_OK = {"daily", "discover", "report", "compare", "secure", "stats"}
+RUN_OK = {"daily", "discover", "report", "compare", "secure", "stats", "watch"}
 
 def _why(t):
     (PUB / "run.txt").write_text("%s\n%s\n" % (t, dt.datetime.now().isoformat(timespec="seconds")),
@@ -807,6 +850,79 @@ def _absorb_secrets(ci):
     _step("ENV_SET_" + "_".join(sorted(got)))
 
 TW_API = "https://api.timeweb.cloud/api/v1/servers/%s"
+
+# ---------- наш список наличия ----------
+def flat(s):
+    """Код без пробелов и дефисов: XEBC-06EU → XEBC06EU. Кириллицу приводим к латинице."""
+    s = norm_code(s)
+    for a, b in zip("АВЕКМНОРСТУХ", "ABEKMHOPCTYX"):
+        s = s.replace(a, b)
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+def watch_codes():
+    """Список наших позиций: сперва Product Center, иначе файл на сервере."""
+    url = env("PM_WATCH_URL")
+    if url:
+        h = {"Accept": "application/json"}
+        tok = env("PM_WATCH_TOKEN")
+        if tok:
+            h["Authorization"] = "Bearer " + tok
+        r = httpx.get(url, headers=h, timeout=30)
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except Exception:
+            return [x.strip() for x in r.text.splitlines() if x.strip()], "адрес (текст)"
+        items = data.get("items", data if isinstance(data, list) else [])
+        out = []
+        for it in items:
+            code = it.get("internal_code") or it.get("article") or it.get("code") or ""
+            if code.strip():
+                out.append(code.strip())
+        return out, "Product Center"
+    f = BASE / "watch.txt"
+    if f.is_file():
+        return [x.strip() for x in f.read_text(encoding="utf-8").splitlines()
+                if x.strip() and not x.startswith("#")], "файл на сервере"
+    return [], "источника нет"
+
+def cmd_watch():
+    """Отмечаем в базе карточки, которые соответствуют нашим позициям в наличии."""
+    codes, src = watch_codes()
+    if not codes:
+        (PUB / "watch.txt").write_text(
+            "список наших позиций пуст (%s) — мониторинг идёт по всем карточкам\n%s\n"
+            % (src, dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
+        print("watch: список пуст (%s)" % src)
+        return
+    hit, miss, per_src = {}, [], {}
+    with db() as c:
+        c.execute("UPDATE product SET watch=NULL WHERE watch IS NOT NULL")
+        rows = c.execute("SELECT id, source, name, model_code FROM product"
+                         " WHERE status='active'").fetchall()
+        idx = [(r, flat(r["model_code"] or ""), flat(r["name"] or "")) for r in rows]
+        for code in codes:
+            f = flat(code)
+            if len(f) < 4:
+                miss.append(code + " (код короче четырёх знаков — не ищу)")
+                continue
+            found = [r for r, mc, nm in idx if (mc and mc == f) or (len(f) >= 6 and f in nm)]
+            if not found:
+                miss.append(code)
+                continue
+            hit[code] = len(found)
+            for r in found:
+                per_src[r["source"]] = per_src.get(r["source"], 0) + 1
+                c.execute("UPDATE product SET watch=%s WHERE id=%s", (code, r["id"]))
+    (PUB / "watch.txt").write_text(
+        "наш список: %d позиций (источник: %s)\n"
+        "нашлось карточек хотя бы на одной площадке: %d\n"
+        "не нашлось нигде: %d\n\nпо площадкам:\n%s\n\nне нашлось:\n%s\n%s\n"
+        % (len(codes), src, len(hit), len(miss),
+           "\n".join("  %-14s %d" % (k, v) for k, v in sorted(per_src.items())),
+           "\n".join("  " + m for m in miss),
+           dt.datetime.now().isoformat(timespec="seconds")), encoding="utf-8")
+    print("watch: %d кодов, найдено %d, не найдено %d" % (len(codes), len(hit), len(miss)))
 
 def cmd_stats():
     """Сколько карточек и сколько из них в списке — по площадкам и брендам."""
@@ -911,7 +1027,7 @@ if __name__ == "__main__":
     args = sys.argv[2:]
     fn = {"discover": cmd_discover, "daily": cmd_daily, "compare": cmd_compare,
           "report": cmd_report, "init": init_db, "secure": cmd_secure,
-          "stats": cmd_stats,
+          "stats": cmd_stats, "watch": cmd_watch,
           "selfupdate": cmd_selfupdate, "postupdate": cmd_postupdate,
           # старые таймеры с каталожных времён — чтобы не падали, ведут на новое
           "crawl": cmd_daily, "export": cmd_compare,
