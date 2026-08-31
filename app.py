@@ -166,11 +166,19 @@ def to_num(s):
 IN_STOCK = re.compile(r"instock|в\s*наличи|есть\s*в\s*наличии|на\s*складе", re.I)
 NO_STOCK = re.compile(r"outofstock|нет\s*в\s*наличии|под\s*заказ|ожидается|preorder|снят", re.I)
 
-# запчасть в названии несёт код аппарата, к которому подходит, — в сравнение её нельзя
+# запчасть в названии несёт код аппарата, к которому подходит, — в сравнение её нельзя.
+# Подставки, направляющие и гастроёмкости — самостоятельный товар, их оставляем.
 PART = re.compile(
-    r"стеклопакет|боковин|делител|перегородк|стыковочн|ручка|направляющ|кронштейн|"
-    r"\bтэн\b|двигател|актуатор|каркас|гастроемкост|подставк|термостат|уплотнител|"
+    r"стеклопакет|боковин|делител|перегородк|стыковочн|\bручка|кронштейн|"
+    r"\bтэн\b|двигател|актуатор|каркас|термостат|уплотнен|уплотнит|прокладк|"
     r"\bпетл|фильтр|запчаст|комплектующ|для\s+печи|для\s+витрин|для\s+шкаф", re.I)
+
+# «… для XF043», «… к XEVC-1011» — название несёт чужой код: это точно принадлежность
+PART_FOR = re.compile(r"\b(?:для|к)\s+[A-ZА-ЯЁ]{2,6}[\s-]?\d", re.I)
+
+def is_part(name):
+    n = name or ""
+    return bool(PART.search(n) or PART_FOR.search(n))
 
 def stock_of(text):
     t = text or ""
@@ -550,12 +558,15 @@ def build_table(in_stock_only=True):
     rows = latest()
     groups = {}
     skipped_parts = 0
+    skipped_names = []
     for r in rows:
         # отключённые площадки в сводку не попадают
         if r["source"] not in SOURCES or r["source"] in OFF:
             continue
-        if PART.search(r["name"] or ""):
+        if is_part(r["name"] or ""):
             skipped_parts += 1
+            if len(skipped_names) < 40:
+                skipped_names.append(r["name"] or "")
             continue
         if in_stock_only and r["in_stock"] is False:
             continue
@@ -581,8 +592,9 @@ def build_table(in_stock_only=True):
             "spread_pct": (float(worst["price"]) - float(best["price"])) / float(best["price"]) * 100,
         })
     out.sort(key=lambda x: (-x["n"], -x["spread_pct"]))
-    (PUB / "parts.txt").write_text("отсеяно запчастей: %d\n" % skipped_parts,
-                                   encoding="utf-8")
+    (PUB / "parts.txt").write_text(
+        "отсеяно как запчасти и принадлежности: %d\nпримеры (до 40):\n%s\n"
+        % (skipped_parts, "\n".join(skipped_names)), encoding="utf-8")
     return out
 
 def cmd_compare(in_stock="1"):
@@ -643,15 +655,22 @@ def cmd_report(in_stock="1"):
                           "+%.0f%%" % t["spread_pct"] if t["spread_pct"] else "—"))
         return "".join(out) or "<tr><td colspan=9>нет данных</td></tr>"
 
+    def table(rs):
+        return ("<table width='100%%' cellpadding='6' "
+                "style='border-collapse:collapse;font-size:13px'>"
+                "<tr style='background:#F2F4F5'><th align=left>Модель</th>%s"
+                "<th align=right>Разброс</th></tr>%s</table>" % (head(), body(rs)))
+
     blocks = ""
     for b, rs in sorted(per_brand.items()):
         m = [t for t in rs if t["n"] > 1]
+        one = [t for t in rs if t["n"] == 1]
         blocks += ("<h3 style='margin:24px 0 6px'>%s — %d позиций, из них на нескольких "
-                   "площадках %d</h3><table width='100%%' cellpadding='6' "
-                   "style='border-collapse:collapse;font-size:13px'>"
-                   "<tr style='background:#F2F4F5'><th align=left>Модель</th>%s"
-                   "<th align=right>Разброс</th></tr>%s</table>"
-                   % (b.capitalize(), len(rs), len(m), head(), body(m or rs)))
+                   "площадках %d</h3>%s" % (b.capitalize(), len(rs), len(m), table(m)))
+        if one:
+            blocks += ("<p style='color:#6B7C84;margin:14px 0 4px;font-size:13px'>"
+                       "%s: только на одной площадке — %d позиций, сравнивать не с чем</p>%s"
+                       % (b.capitalize(), len(one), table(one)))
 
     html = ("<html><body style=\"font-family:Arial,sans-serif;font-size:14px;color:#12181B\">"
             "<h2 style='margin:0 0 4px'>Мониторинг цен — %s</h2>"
