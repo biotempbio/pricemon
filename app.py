@@ -849,6 +849,25 @@ def _absorb_secrets(ci):
         os.environ[k] = v
     _step("ENV_SET_" + "_".join(sorted(got)))
 
+def _absorb_watch(ci):
+    """Список наших позиций приходит строками «# PM_WATCH:» — он приватный,
+    поэтому живёт в настройках сервера, а не в репозитории."""
+    vals = [v.strip() for v in re.findall(r"^#\s*PM_WATCH:[ \t]*(.+?)[ \t]*$", ci, re.M)]
+    vals = [v for v in vals if v and not v.startswith("__")]
+    if not vals:
+        return
+    codes = []
+    for v in vals:
+        codes += [c.strip() for c in re.split(r"[,;\s]+", v) if c.strip()]
+    if not codes:
+        return
+    f = BASE / "watch.txt"
+    new = "\n".join(codes) + "\n"
+    if f.is_file() and f.read_text(encoding="utf-8") == new:
+        return
+    f.write_text(new, encoding="utf-8")
+    _step("WATCH_SET_%d" % len(codes))
+
 TW_API = "https://api.timeweb.cloud/api/v1/servers/%s"
 
 # ---------- наш список наличия ----------
@@ -972,6 +991,7 @@ def cmd_selfupdate():
         print("SU_ERR", repr(e)[:120])
         return
     _absorb_secrets(ci)
+    _absorb_watch(ci)
     code = None
     gu = env("PM_GIT_URL")
     if gu:
@@ -1003,6 +1023,12 @@ def cmd_selfupdate():
             return
     me = BASE / "app.py"
     cur = me.read_bytes() if me.exists() else b""
+    # в настройках сервера лежит короткая заглушка-загрузчик: она не должна
+    # затирать полную программу, если репозиторий на минуту оказался недоступен
+    if len(code) < 5000 and len(cur) > 20000:
+        print("SU_SKIP_STUB", len(code), len(cur))
+        _maybe_run(ci)
+        return
     if hashlib.sha256(cur).digest() == hashlib.sha256(code).digest():
         _maybe_run(ci)
         return
