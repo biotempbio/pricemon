@@ -14,7 +14,12 @@ BASE = Path(os.environ.get("PM_BASE", "/opt/pricemon"))
 DATA = Path(os.environ.get("PM_DATA", "/var/lib/pricemon"))
 RAW = DATA / "raw"
 PUB = DATA / "pub"
-for p in (RAW, PUB):
+ARCHIVE = DATA / "archive"
+ARCHIVE_RAW = ARCHIVE / "raw"
+ARCHIVE_PRICES = ARCHIVE / "prices"
+ARCHIVE_RUNS = ARCHIVE / "runs"
+PUSH_QUEUE = DATA / "push-queue"
+for p in (RAW, PUB, ARCHIVE_RAW, ARCHIVE_PRICES, ARCHIVE_RUNS, PUSH_QUEUE):
     p.mkdir(parents=True, exist_ok=True)
 
 def env(k, d=""):
@@ -644,16 +649,68 @@ def cmd_compare(in_stock="1"):
                        ["%.0f" % t["min"], SOURCES[t["min_src"]]["title"],
                         "%.0f" % t["spread"], "%.1f" % t["spread_pct"], t["min_url"]])
     multi = [t for t in tbl if t["n"] > 1]
-    json.dump({"generated": dt.datetime.now().isoformat(timespec="seconds"),
+    generated = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    payload = {"generated": generated,
                "brands": sorted(set(t["brand"] for t in tbl)),
                "positions": len(tbl), "comparable": len(multi),
-               "rows": [{k: v for k, v in t.items() if k != "sources"} for t in tbl]},
-              (PUB / "compare.json").open("w", encoding="utf-8"), ensure_ascii=False, indent=1)
+               "rows": [{k: v for k, v in t.items() if k != "sources"} for t in tbl]}
+    json.dump(payload, (PUB / "compare.json").open("w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print("compare: позиций %d, сравнимых %d" % (len(tbl), len(multi)))
-    push_snapshot()
+    push_result = push_snapshot(generated=generated)
+    archive_compare_run(tbl, payload, push_result)
     return tbl
 
-def push_snapshot():
+def run_id_from(generated):
+    return re.sub(r"[^0-9A-Za-z]+", "-", generated).strip("-")
+
+def _post_snapshot(src, generated, run_id):
+    url = env("PM_PRODUCT_CENTER_URL").strip()
+    tok = env("PM_PRODUCT_CENTER_TOKEN").strip()
+    waits = (1, 2, 4, 8, 16)
+    last = None
+    for attempt, wait in enumerate(waits, 1):
+        try:
+            r = httpx.post(url, content=src.read_bytes(), headers={
+                "Authorization": "Bearer " + tok,
+                "Content-Type": "text/csv; charset=utf-8",
+                "Idempotency-Key": run_id,
+                "X-Filename": src.name,
+                "X-Snapshot-Generated": generated,
+                "User-Agent": "BIO-price-monitor/2.0",
+            }, timeout=60)
+            r.raise_for_status()
+            return {"ok": True, "status": r.status_code, "attempts": attempt,
+                    "response": r.text[:1000], "run_id": run_id}
+        except Exception as e:
+            last = repr(e)[:500]
+            if attempt < len(waits):
+                time.sleep(wait)
+    return {"ok": False, "attempts": len(waits), "error": last, "run_id": run_id}
+
+def _queue_snapshot(src, generated, run_id):
+    csv_path = PUSH_QUEUE / (run_id + ".csv")
+    meta_path = PUSH_QUEUE / (run_id + ".json")
+    csv_path.write_bytes(src.read_bytes())
+    meta_path.write_text(json.dumps({"run_id": run_id, "generated": generated,
+                                     "csv": csv_path.name}, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+
+def drain_push_queue():
+    delivered = []
+    for meta_path in sorted(PUSH_QUEUE.glob("*.json")):
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        csv_path = PUSH_QUEUE / meta["csv"]
+        if not csv_path.is_file():
+            continue
+        result = _post_snapshot(csv_path, meta["generated"], meta["run_id"])
+        if not result["ok"]:
+            break
+        csv_path.unlink()
+        meta_path.unlink()
+        delivered.append(meta["run_id"])
+    return delivered
+
+def push_snapshot(generated=None):
     """Отправляет утренний compare.csv в BIO Product Center по защищённому push-контракту."""
     url = env("PM_PRODUCT_CENTER_URL").strip()
     tok = env("PM_PRODUCT_CENTER_TOKEN").strip()
@@ -665,23 +722,44 @@ def push_snapshot():
     if not src.is_file():
         status.write_text("compare.csv не найден\n%s\n" % dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
         return False
-    generated = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    try:
-        r = httpx.post(url, content=src.read_bytes(), headers={
-            "Authorization": "Bearer " + tok,
-            "Content-Type": "text/csv; charset=utf-8",
-            "X-Filename": "compare.csv",
-            "X-Snapshot-Generated": generated,
-            "User-Agent": "BIO-price-monitor/1.0",
-        }, timeout=60)
-        r.raise_for_status()
-        status.write_text("успешно: HTTP %d\n%s\n%s\n" % (r.status_code, generated, r.text[:1000]), encoding="utf-8")
-        print("product-center push: HTTP", r.status_code)
-        return True
-    except Exception as e:
-        status.write_text("ошибка: %s\n%s\n" % (repr(e)[:500], generated), encoding="utf-8")
-        print("product-center push error:", repr(e)[:160])
-        return False
+    generated = generated or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    run_id = run_id_from(generated)
+    delivered = drain_push_queue()
+    result = _post_snapshot(src, generated, run_id)
+    result["delivered_from_queue"] = delivered
+    if result["ok"]:
+        status.write_text("успешно: HTTP %d, попыток %d\n%s\n%s\n" %
+                          (result["status"], result["attempts"], generated, result["response"]), encoding="utf-8")
+        print("product-center push: HTTP", result["status"])
+    else:
+        _queue_snapshot(src, generated, run_id)
+        status.write_text("отложено в очередь после %d попыток: %s\n%s\n" %
+                          (result["attempts"], result["error"], generated), encoding="utf-8")
+        print("product-center push queued:", result["error"])
+    return result
+
+def archive_compare_run(tbl, payload, push_result):
+    """Сохраняет сырой рынок, нормализованный снимок и отчёт запуска без внутренних цен."""
+    day = payload["generated"][:10]
+    raw = {"generated": payload["generated"], "offers": []}
+    for item in tbl:
+        for source, offer in item["sources"].items():
+            raw["offers"].append({
+                "brand": item["brand"], "model_code": item["code"], "name": item["name"],
+                "source": source, "price": float(offer["price"]), "url": offer["url"],
+                "seen_at": str(offer["captured_date"]), "in_stock": offer["in_stock"],
+            })
+    with gzip.open(ARCHIVE_RAW / (day + ".json.gz"), "wt", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, separators=(",", ":"))
+    (ARCHIVE_PRICES / (day + ".json")).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report = {
+        "run_id": push_result.get("run_id"), "generated": payload["generated"],
+        "agent_version": "v42", "positions": payload["positions"],
+        "comparable": payload["comparable"], "push": push_result,
+    }
+    (ARCHIVE_RUNS / (day + ".json")).write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 # ---------- утреннее письмо ----------
 def coverage_line():
