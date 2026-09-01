@@ -134,6 +134,17 @@ class AppTests(unittest.TestCase):
         self.assertEqual(index["12345"]["dealer_price"], 10)
         self.assertEqual(index["XEBC06EUE1RM"]["dealer_price"], 10)
 
+    def test_env_file_loads_values_without_overwriting_process(self):
+        env_file = self.app.BASE / ".env-extra"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("PM_NEW_VALUE=from-file\nPM_EXISTING=file-value\n", encoding="utf-8")
+        os.environ["PM_EXISTING"] = "process-value"
+        self.app.load_env_file(env_file)
+        self.assertEqual(os.environ["PM_NEW_VALUE"], "from-file")
+        self.assertEqual(os.environ["PM_EXISTING"], "process-value")
+        os.environ.pop("PM_NEW_VALUE", None)
+        os.environ.pop("PM_EXISTING", None)
+
     def test_part_model_alias_does_not_shadow_device(self):
         self.app.write_json(self.app.REFERENCE / "parts.json", {"items": [{
             "product_code": "63843", "model": "XB893",

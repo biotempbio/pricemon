@@ -14,6 +14,23 @@ from psycopg.rows import dict_row
 
 BASE = Path(os.environ.get("PM_BASE", "/opt/pricemon"))
 DATA = Path(os.environ.get("PM_DATA", "/var/lib/pricemon"))
+
+def load_env_file(path):
+    """Загружает простой KEY=VALUE файл без перезаписи переменных процесса."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            os.environ.setdefault(key, value.strip())
+
+load_env_file(BASE / ".env")
 RAW = DATA / "raw"
 PUB = DATA / "pub"
 ARCHIVE = DATA / "archive"
