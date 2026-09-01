@@ -10,8 +10,8 @@ import httpx
 import psycopg
 from psycopg.rows import dict_row
 
-BASE = Path("/opt/pricemon")
-DATA = Path("/var/lib/pricemon")
+BASE = Path(os.environ.get("PM_BASE", "/opt/pricemon"))
+DATA = Path(os.environ.get("PM_DATA", "/var/lib/pricemon"))
 RAW = DATA / "raw"
 PUB = DATA / "pub"
 for p in (RAW, PUB):
@@ -845,8 +845,10 @@ def _maybe_run(ci):
         mark.write_text("skip")
         return _why("команда не разрешена: %s" % line)
     _why("запускаю: %s" % line)
-    mark.write_text("run")
     _step("RUN_" + parts[0])
+    # Метка создаётся только главным диспетчером после успешного завершения.
+    # Иначе NameError внутри команды навсегда маскируется как выполненная команда.
+    os.environ["PM_RUN_SUCCESS_MARK"] = str(mark)
     os.execv(sys.executable, [sys.executable, str(BASE / "app.py")] + parts)
 
 def _absorb_secrets(ci):
@@ -913,6 +915,17 @@ def flat(s):
         s = s.replace(a, b)
     return re.sub(r"[^A-Z0-9]", "", s)
 
+def code_matches(code, model, name):
+    """Коды короче шести знаков сопоставляются только целиком."""
+    if not code or not model:
+        return False
+    if len(code) < 6:
+        return model == code
+    return (model == code
+            or (model.startswith(code) and len(model) <= len(code) + 4)
+            or (code.startswith(model) and len(model) >= 5 and len(code) <= len(model) + 2)
+            or code in name)
+
 def watch_codes():
     """Список наших позиций: сперва Product Center, иначе файл на сервере."""
     url = env("PM_WATCH_URL")
@@ -963,13 +976,7 @@ def cmd_watch():
             # точное совпадение; либо код модели начинается с нашего и дописан
             # немногим (D4VM4 → D4VM4001), но не разросся (GC111 → GC1110VV061);
             # либо длинный код целиком встречается в названии
-            found = [r for r, mc, nm in idx
-                     if (mc and (mc == f
-                                 # карточка подробнее нашего кода: D4VM4 → D4VM4001
-                                 or (mc.startswith(f) and len(mc) <= len(f) + 4)
-                                 # карточка короче на хвостик: DB1050A0 → DB1050
-                                 or (f.startswith(mc) and len(mc) >= 5 and len(f) <= len(mc) + 2)))
-                     or (len(f) >= 6 and f in nm)]
+            found = [r for r, mc, nm in idx if code_matches(f, mc, nm)]
             if not found:
                 # подсказка: что похожее вообще есть на площадках — сразу видно,
                 # товара нет в продаже или это мы не сумели сопоставить код
@@ -1088,13 +1095,11 @@ def cmd_postupdate():
     sid, tok = env("PM_TW_SERVER_ID"), env("PM_TW_TOKEN")
     if not (sid and tok):
         return
-    try:
-        r = httpx.get(TW_API % sid, headers={"Authorization": "Bearer " + tok}, timeout=30)
-        ci = r.json().get("server", {}).get("cloud_init") or ""
-        _absorb_secrets(ci)
-        _maybe_run(ci)
-    except Exception as e:
-        print("PU_ERR", repr(e)[:120])
+    r = httpx.get(TW_API % sid, headers={"Authorization": "Bearer " + tok}, timeout=30)
+    r.raise_for_status()
+    ci = r.json().get("server", {}).get("cloud_init") or ""
+    _absorb_secrets(ci)
+    _maybe_run(ci)
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
@@ -1112,6 +1117,11 @@ if __name__ == "__main__":
     # любая поломка должна быть видна снаружи, а не только в системном журнале
     try:
         fn(*args)
+        success_mark = env("PM_RUN_SUCCESS_MARK").strip()
+        if success_mark:
+            Path(success_mark).write_text(
+                "%s\n%s\n" % (cmd, dt.datetime.now().isoformat(timespec="seconds")),
+                encoding="utf-8")
         (PUB / ("last-%s.txt" % cmd)).write_text(
             "%s %s — успешно\n%s\n" % (cmd, " ".join(args),
                                        dt.datetime.now().isoformat(timespec="seconds")),
