@@ -10,7 +10,8 @@ NEED = {
     "is_part", "stock_of", "parse_shop", "parse_entero", "parse_card", "model_code",
     "sitemap_urls", "discover_entero", "discover_slug", "discover_brandpage",
     "cmd_discover", "interleave", "cmd_daily", "latest", "build_table", "cmd_compare",
-    "push_snapshot", "archive_compare_run", "cmd_report", "send_mail", "log", "_step", "cmd_selfupdate",
+    "push_snapshot", "archive_compare_run", "fetch_policy", "refresh_eur_rate",
+    "calculate_price_item", "cmd_calculate", "cmd_report", "send_mail", "log", "_step", "cmd_selfupdate",
 }
 
 

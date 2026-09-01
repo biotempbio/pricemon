@@ -3,6 +3,8 @@
 # Команды: discover|daily|compare|report|selftest|init|selfupdate|postupdate
 import os, re, sys, json, time, random, hashlib, gzip, base64, ast, traceback
 import datetime as dt
+import math
+import xml.etree.ElementTree as ET
 from html import unescape as _un
 from pathlib import Path
 
@@ -19,7 +21,8 @@ ARCHIVE_RAW = ARCHIVE / "raw"
 ARCHIVE_PRICES = ARCHIVE / "prices"
 ARCHIVE_RUNS = ARCHIVE / "runs"
 PUSH_QUEUE = DATA / "push-queue"
-for p in (RAW, PUB, ARCHIVE_RAW, ARCHIVE_PRICES, ARCHIVE_RUNS, PUSH_QUEUE):
+REFERENCE = DATA / "reference"
+for p in (RAW, PUB, ARCHIVE_RAW, ARCHIVE_PRICES, ARCHIVE_RUNS, PUSH_QUEUE, REFERENCE):
     p.mkdir(parents=True, exist_ok=True)
 
 def env(k, d=""):
@@ -166,6 +169,181 @@ def to_num(s):
     except Exception:
         return None
     return v if v > 0 else None
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+def reference_items(name):
+    data = read_json(REFERENCE / name, {}) or {}
+    return data.get("items", data if isinstance(data, list) else [])
+
+def reference_index(name):
+    return {flat(str(item.get("product_code") or item.get("model") or "")): item
+            for item in reference_items(name)
+            if item.get("product_code") or item.get("model")}
+
+def fetch_policy():
+    """Политика принадлежит Product Center; локально хранится только последний ответ."""
+    url = env("PM_POLICY_URL").strip()
+    token = env("PM_READ_TOKEN", env("PM_WATCH_TOKEN")).strip()
+    cache = REFERENCE / "policy-cache.json"
+    if not url:
+        saved = read_json(cache)
+        if saved:
+            return saved, "cache"
+        raise RuntimeError("PM_POLICY_URL не настроен и кэша политики нет")
+    try:
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        response = httpx.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        policy = response.json()
+        required = ("version", "market_multiplier", "cost_floor_multiplier", "rounding",
+                    "min_platforms", "derived_coefficients", "anomaly_cost_dealer_ratio")
+        absent = [key for key in required if key not in policy]
+        if absent:
+            raise ValueError("неполная политика: " + ", ".join(absent))
+        write_json(cache, policy)
+        return policy, "product-center"
+    except Exception:
+        saved = read_json(cache)
+        if saved:
+            return saved, "cache"
+        raise
+
+def refresh_eur_rate():
+    """Получает официальный EUR/RUB ЦБ; при ошибке возвращает последнее значение."""
+    url = "https://www.cbr.ru/scripts/XML_daily.asp"
+    cache = REFERENCE / "eur-rate.json"
+    try:
+        response = httpx.get(url, timeout=30, headers={"User-Agent": UA})
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        node = next((item for item in root.findall("Valute")
+                     if (item.findtext("CharCode") or "").strip() == "EUR"), None)
+        if node is None:
+            raise ValueError("EUR отсутствует в ответе ЦБ")
+        nominal = int(node.findtext("Nominal") or "1")
+        value = float((node.findtext("Value") or "").replace(",", ".")) / nominal
+        result = {"currency": "EUR", "rate_rub": value, "effective_date": root.attrib.get("Date"),
+                  "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "source": url}
+        write_json(cache, result)
+        return result, "cbr"
+    except Exception:
+        saved = read_json(cache)
+        if saved:
+            return saved, "cache"
+        raise
+
+EXCLUDED_PRICE_NAME = re.compile(r"уценк|разбит|\bб\s*/\s*у\b|\bбрак\b", re.I)
+
+def derived_k(brand, dealer_rub, policy):
+    coefficients = policy["derived_coefficients"]
+    normalized = (brand or "").strip().lower()
+    if normalized in ("carboma", "полюс", "polus"):
+        return float(coefficients["carboma"])
+    if normalized != "unox":
+        return None
+    for tier in coefficients["unox"]:
+        maximum = tier.get("max_dealer_price")
+        if maximum is None or dealer_rub <= float(maximum):
+            return float(tier["k"])
+    return None
+
+def ceil_policy(value, policy):
+    step = float(policy["rounding"]["step"])
+    if policy["rounding"].get("mode") != "ceil" or step <= 0:
+        raise ValueError("неподдерживаемое округление политики")
+    return int(math.ceil(value / step) * step)
+
+def calculate_price_item(item, policy, eur_rate):
+    """Чистый расчёт одной позиции; чувствительные входы не возвращаются."""
+    name = str(item.get("name") or "")
+    if (item.get("kind") == "part" or item.get("usable") is False or is_part(name)
+            or EXCLUDED_PRICE_NAME.search(name) or "+" in name):
+        return {"price": None, "price_source": None, "price_rule": None,
+                "publishable": False, "reason": "excluded_item"}
+    offers = [offer for offer in item.get("offers", [])
+              if offer.get("usable", True) and offer.get("in_stock", True)
+              and offer.get("match_confidence", "exact") == "exact" and to_num(offer.get("price"))]
+    platforms = len({offer.get("source") for offer in offers})
+    multiplier = float(policy["market_multiplier"])
+    base = source = rule = None
+    min_offer = min(offers, key=lambda offer: float(offer["price"])) if offers else None
+    if min_offer and platforms >= int(policy["min_platforms"]):
+        base = float(min_offer["price"]) * multiplier
+        source, rule = "monitor", "market_plus"
+    dealer = to_num(item.get("dealer_price"))
+    dealer_currency = str(item.get("dealer_currency") or "RUB").upper()
+    dealer_rub = dealer
+    if dealer and dealer_currency == "EUR":
+        dealer_rub = dealer * float(eur_rate["rate_rub"])
+    if base is None and dealer_rub:
+        coefficient = derived_k(item.get("brand"), dealer_rub, policy)
+        if coefficient is not None:
+            base = dealer_rub * coefficient * multiplier
+            source, rule = "derived", "derived"
+    if base is None:
+        return {"price": None, "price_source": None, "price_rule": None,
+                "publishable": False, "reason": "no_price"}
+    cost = to_num(item.get("cost"))
+    cost_currency = str(item.get("cost_currency") or "RUB").upper()
+    cost_rub = cost
+    if cost and cost_currency == "EUR":
+        cost_rub = cost * float(policy["eur_import_coefficient"]) * float(eur_rate["rate_rub"])
+    if cost_rub and dealer_rub:
+        ratio = cost_rub / dealer_rub
+        bounds = policy["anomaly_cost_dealer_ratio"]
+        if ratio < float(bounds["min"]) or ratio > float(bounds["max"]):
+            return {"price": None, "price_source": source, "price_rule": rule,
+                    "publishable": False, "reason": "check_cost", "platforms": platforms}
+    if cost_rub and base < cost_rub * float(policy["cost_floor_multiplier"]):
+        base = cost_rub * float(policy["cost_floor_multiplier"])
+        rule = "cost_floor"
+    return {"price": ceil_policy(base, policy), "price_source": source, "price_rule": rule,
+            "publishable": True, "reason": "ready", "platforms": platforms,
+            "min_price": float(min_offer["price"]) if min_offer else None,
+            "min_source": min_offer.get("source") if min_offer else None}
+
+def cmd_rate():
+    rate, source = refresh_eur_rate()
+    print("EUR %.4f RUB (%s, %s)" % (rate["rate_rub"], rate.get("effective_date"), source))
+
+def cmd_policy():
+    policy, source = fetch_policy()
+    print("policy version=%s market_multiplier=%s source=%s" %
+          (policy["version"], policy["market_multiplier"], source))
+
+def cmd_calculate():
+    policy, policy_source = fetch_policy()
+    eur_rate, rate_source = refresh_eur_rate()
+    market = read_json(PUB / "compare.json", {}) or {}
+    dealers, costs, stock = (reference_index("dealer-prices.json"),
+                             reference_index("costs.json"), reference_index("stock.json"))
+    items = []
+    for row in market.get("rows", []):
+        code = flat(str(row.get("code") or ""))
+        dealer, cost, inventory = dealers.get(code, {}), costs.get(code, {}), stock.get(code, {})
+        calculation = calculate_price_item({
+            "brand": row.get("brand"), "name": row.get("name"), "kind": dealer.get("kind", "device"),
+            "offers": row.get("offers", []), "dealer_price": dealer.get("dealer_price"),
+            "dealer_currency": dealer.get("dealer_currency"), "cost": cost.get("cost"),
+            "cost_currency": cost.get("cost_currency"), "in_stock": bool(
+                to_num(inventory.get("free_qty")) or to_num(inventory.get("reserved_qty"))),
+        }, policy, eur_rate)
+        items.append({"product_id": dealer.get("product_id"), "brand": row.get("brand"),
+                      "model_code": row.get("code"), **calculation})
+    generated = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = {"generated": generated, "policy_version": policy["version"],
+               "policy_source": policy_source, "eur_rate_source": rate_source, "items": items}
+    write_json(PUB / "prices.json", payload)
+    write_json(ARCHIVE_PRICES / (generated[:10] + ".json"), payload)
+    print("calculate: %d items, %d prices" % (len(items), sum(x["price"] is not None for x in items)))
 
 # ---------- разбор карточки ----------
 IN_STOCK = re.compile(r"instock|в\s*наличи|есть\s*в\s*наличии|на\s*складе", re.I)
@@ -653,7 +831,12 @@ def cmd_compare(in_stock="1"):
     payload = {"generated": generated,
                "brands": sorted(set(t["brand"] for t in tbl)),
                "positions": len(tbl), "comparable": len(multi),
-               "rows": [{k: v for k, v in t.items() if k != "sources"} for t in tbl]}
+               "rows": [{**{k: v for k, v in t.items() if k != "sources"},
+                         "offers": [{"source": source, "price": float(offer["price"]),
+                                     "url": offer["url"], "in_stock": offer["in_stock"],
+                                     "match_confidence": "exact", "usable": True}
+                                    for source, offer in t["sources"].items()]}
+                        for t in tbl]}
     json.dump(payload, (PUB / "compare.json").open("w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print("compare: позиций %d, сравнимых %d" % (len(tbl), len(multi)))
     push_result = push_snapshot(generated=generated)
@@ -903,7 +1086,8 @@ def _step(msg):
         f.write("%s %s\n" % (msg, dt.datetime.now().isoformat(timespec="seconds")))
 
 
-RUN_OK = {"daily", "discover", "report", "compare", "secure", "stats", "watch"}
+RUN_OK = {"daily", "discover", "report", "compare", "secure", "stats", "watch",
+          "rate", "policy", "calculate"}
 
 def _why(t):
     (PUB / "run.txt").write_text("%s\n%s\n" % (t, dt.datetime.now().isoformat(timespec="seconds")),
@@ -935,7 +1119,7 @@ def _absorb_secrets(ci):
     for key in ("PM_SMTP_USER", "PM_SMTP_PASS", "PM_MAIL_TO",
                 "PM_GIT_URL", "PM_GIT_TOKEN",
                 "PM_PRODUCT_CENTER_URL", "PM_PRODUCT_CENTER_TOKEN",
-                "PM_WATCH_URL", "PM_WATCH_TOKEN"):
+                "PM_WATCH_URL", "PM_WATCH_TOKEN", "PM_POLICY_URL", "PM_READ_TOKEN"):
         # берём последнюю такую строку
         vals = [v.strip() for v in re.findall(r"^#\s*%s:[ \t]*(.+?)[ \t]*$" % key, ci, re.M)]
         vals = [v for v in vals if v and not v.startswith("__")]
@@ -1185,6 +1369,7 @@ if __name__ == "__main__":
     fn = {"discover": cmd_discover, "daily": cmd_daily, "compare": cmd_compare,
           "report": cmd_report, "init": init_db, "secure": cmd_secure,
           "stats": cmd_stats, "watch": cmd_watch,
+          "rate": cmd_rate, "policy": cmd_policy, "calculate": cmd_calculate,
           "selfupdate": cmd_selfupdate, "postupdate": cmd_postupdate,
           # старые таймеры с каталожных времён — чтобы не падали, ведут на новое
           "crawl": cmd_daily, "export": cmd_compare,
