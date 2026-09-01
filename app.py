@@ -650,7 +650,38 @@ def cmd_compare(in_stock="1"):
                "rows": [{k: v for k, v in t.items() if k != "sources"} for t in tbl]},
               (PUB / "compare.json").open("w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print("compare: позиций %d, сравнимых %d" % (len(tbl), len(multi)))
+    push_snapshot()
     return tbl
+
+def push_snapshot():
+    """Отправляет утренний compare.csv в BIO Product Center по защищённому push-контракту."""
+    url = env("PM_PRODUCT_CENTER_URL").strip()
+    tok = env("PM_PRODUCT_CENTER_TOKEN").strip()
+    src = PUB / "compare.csv"
+    status = PUB / "product-center-push.txt"
+    if not (url and tok):
+        status.write_text("push не настроен\n%s\n" % dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+        return False
+    if not src.is_file():
+        status.write_text("compare.csv не найден\n%s\n" % dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+        return False
+    generated = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        r = httpx.post(url, content=src.read_bytes(), headers={
+            "Authorization": "Bearer " + tok,
+            "Content-Type": "text/csv; charset=utf-8",
+            "X-Filename": "compare.csv",
+            "X-Snapshot-Generated": generated,
+            "User-Agent": "BIO-price-monitor/1.0",
+        }, timeout=60)
+        r.raise_for_status()
+        status.write_text("успешно: HTTP %d\n%s\n%s\n" % (r.status_code, generated, r.text[:1000]), encoding="utf-8")
+        print("product-center push: HTTP", r.status_code)
+        return True
+    except Exception as e:
+        status.write_text("ошибка: %s\n%s\n" % (repr(e)[:500], generated), encoding="utf-8")
+        print("product-center push error:", repr(e)[:160])
+        return False
 
 # ---------- утреннее письмо ----------
 def coverage_line():
@@ -822,7 +853,9 @@ def _absorb_secrets(ci):
     """Переносим строки «# PM_...:» из cloud-init в .env и убираем из памяти."""
     got = {}
     for key in ("PM_SMTP_USER", "PM_SMTP_PASS", "PM_MAIL_TO",
-                "PM_GIT_URL", "PM_GIT_TOKEN"):
+                "PM_GIT_URL", "PM_GIT_TOKEN",
+                "PM_PRODUCT_CENTER_URL", "PM_PRODUCT_CENTER_TOKEN",
+                "PM_WATCH_URL", "PM_WATCH_TOKEN"):
         # берём последнюю такую строку
         vals = [v.strip() for v in re.findall(r"^#\s*%s:[ \t]*(.+?)[ \t]*$" % key, ci, re.M)]
         vals = [v for v in vals if v and not v.startswith("__")]
