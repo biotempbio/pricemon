@@ -184,9 +184,28 @@ def reference_items(name):
     return data.get("items", data if isinstance(data, list) else [])
 
 def reference_index(name):
-    return {flat(str(item.get("product_code") or item.get("model") or "")): item
-            for item in reference_items(name)
-            if item.get("product_code") or item.get("model")}
+    index = {}
+    for item in reference_items(name):
+        values = [item.get("product_code"), item.get("internal_code")]
+        if reference_model_usable(item):
+            values.append(item.get("model"))
+        for value in values:
+            key = flat(str(value or ""))
+            if key:
+                index[key] = item
+    return index
+
+def reference_model_usable(item):
+    category = str(item.get("category") or "")
+    return (item.get("kind") != "part" and item.get("usable") is not False
+            and "." not in category and not is_part(str(item.get("name") or "")))
+
+def reference_lookup(index, *values):
+    for value in values:
+        item = index.get(flat(str(value or "")))
+        if item:
+            return item
+    return {}
 
 def fetch_policy():
     """Политика принадлежит Product Center; локально хранится только последний ответ."""
@@ -268,6 +287,9 @@ def calculate_price_item(item, policy, eur_rate):
             or EXCLUDED_PRICE_NAME.search(name) or "+" in name):
         return {"price": None, "price_source": None, "price_rule": None,
                 "publishable": False, "reason": "excluded_item"}
+    if item.get("in_stock") is False:
+        return {"price": None, "price_source": None, "price_rule": None,
+                "publishable": False, "reason": "no_stock"}
     offers = [offer for offer in item.get("offers", [])
               if offer.get("usable", True) and offer.get("in_stock", True)
               and offer.get("match_confidence", "exact") == "exact" and to_num(offer.get("price"))]
@@ -325,18 +347,38 @@ def cmd_calculate():
     market = read_json(PUB / "compare.json", {}) or {}
     dealers, costs, stock = (reference_index("dealer-prices.json"),
                              reference_index("costs.json"), reference_index("stock.json"))
+    market_rows = {flat(str(row.get("code") or "")): row for row in market.get("rows", [])
+                   if row.get("code")}
+    calculation_rows, matched_market = [], set()
+    for dealer in reference_items("dealer-prices.json"):
+        model_key = flat(str(dealer.get("model") or ""))
+        row = market_rows.get(model_key) if reference_model_usable(dealer) else None
+        if row:
+            matched_market.add(model_key)
+        calculation_rows.append((row or {
+            "code": dealer.get("model") or dealer.get("product_code"),
+            "brand": dealer.get("brand"), "name": dealer.get("name"), "offers": []
+        }, dealer))
+    for code, row in market_rows.items():
+        if code not in matched_market:
+            calculation_rows.append((row, {}))
     items = []
-    for row in market.get("rows", []):
-        code = flat(str(row.get("code") or ""))
-        dealer, cost, inventory = dealers.get(code, {}), costs.get(code, {}), stock.get(code, {})
+    for row, dealer in calculation_rows:
+        dealer = dealer or reference_lookup(dealers, row.get("code"), row.get("product_code"))
+        aliases = (row.get("code"), dealer.get("product_code"), dealer.get("internal_code"),
+                   dealer.get("model"))
+        cost, inventory = reference_lookup(costs, *aliases), reference_lookup(stock, *aliases)
         calculation = calculate_price_item({
-            "brand": row.get("brand"), "name": row.get("name"), "kind": dealer.get("kind", "device"),
+            "brand": row.get("brand") or dealer.get("brand"),
+            "name": row.get("name") or dealer.get("name"), "kind": dealer.get("kind", "device"),
             "offers": row.get("offers", []), "dealer_price": dealer.get("dealer_price"),
             "dealer_currency": dealer.get("dealer_currency"), "cost": cost.get("cost"),
             "cost_currency": cost.get("cost_currency"), "in_stock": bool(
                 to_num(inventory.get("free_qty")) or to_num(inventory.get("reserved_qty"))),
         }, policy, eur_rate)
-        items.append({"product_id": dealer.get("product_id"), "brand": row.get("brand"),
+        items.append({"product_id": dealer.get("product_id"),
+                      "product_code": dealer.get("product_code") or dealer.get("internal_code"),
+                      "brand": row.get("brand") or dealer.get("brand"),
                       "model_code": row.get("code"), **calculation})
     generated = dt.datetime.now(dt.timezone.utc).isoformat()
     payload = {"generated": generated, "policy_version": policy["version"],
@@ -355,7 +397,7 @@ NO_STOCK = re.compile(r"outofstock|нет\s*в\s*наличии|под\s*зак�
 PART = re.compile(
     r"стеклопакет|боковин|делител|перегородк|стыковочн|ручка|кронштейн|"
     r"\bтэн\b|двигател|актуатор|каркас|термостат|уплотнен|уплотнит|прокладк|"
-    r"\bпетл|фильтр|решётк|решетк|противень|поддон", re.I)
+    r"\bпетл|фильтр|решётк|решетк|противень|поддон|клапан|панел.*управлен|таймер", re.I)
 
 # эти слова однозначны в любом месте названия
 PART_ANY = re.compile(r"запчаст|комплектующ", re.I)

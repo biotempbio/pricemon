@@ -120,6 +120,29 @@ class AppTests(unittest.TestCase):
             "dealer_price": 100000}, self.policy(), {"rate_rub": 100})
         self.assertEqual(result["reason"], "excluded_item")
 
+    def test_out_of_stock_item_has_no_price(self):
+        result = self.app.calculate_price_item({"brand": "carboma", "name": "Витрина Carboma",
+            "in_stock": False, "dealer_price": 100000}, self.policy(), {"rate_rub": 100})
+        self.assertEqual(result["reason"], "no_stock")
+        self.assertFalse(result["publishable"])
+
+    def test_reference_index_uses_internal_code_and_model(self):
+        self.app.write_json(self.app.REFERENCE / "aliases.json", {"items": [{
+            "product_code": "12345", "model": "XEBC-06EU-E1RM", "dealer_price": 10,
+        }]})
+        index = self.app.reference_index("aliases.json")
+        self.assertEqual(index["12345"]["dealer_price"], 10)
+        self.assertEqual(index["XEBC06EUE1RM"]["dealer_price"], 10)
+
+    def test_part_model_alias_does_not_shadow_device(self):
+        self.app.write_json(self.app.REFERENCE / "parts.json", {"items": [{
+            "product_code": "63843", "model": "XB893",
+            "name": "Прокладка петли внутреннего стекла UNOX", "dealer_price": 10,
+        }]})
+        index = self.app.reference_index("parts.json")
+        self.assertIn("63843", index)
+        self.assertNotIn("XB893", index)
+
 
 if __name__ == "__main__":
     unittest.main()
